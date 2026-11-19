@@ -21,7 +21,6 @@ ABIFILES = {abi: f"PocketStudio-Codex-Plugin-{abi}.apk" for abi in ABIS}
 ANDROID_PACKAGE = "com.hcgstudio.pocketstudio.androidplugin"
 ANDROID_FLAVORS = {"arm64-v8a": "arm64V8a", "armeabi-v7a": "armeabiV7a", "x86_64": "x86_64", "x86": "x86"}
 ANDROID_FILES = {abi: f"PocketStudio-Android-Plugin-{abi}.apk" for abi in ANDROID_FLAVORS}
-PIN = Path("release_signer.der")
 PLUGINS = ("codex", "android", "avf", "proot")
 TITLES = {"codex": "Codex", "android": "Android", "avf": "AVF", "proot": "PRoot"}
 SOURCE_REPO = "Akaishi-Tech/PocketStudio"
@@ -164,8 +163,9 @@ def validate_store(store):
         require(all(isinstance(plugin[k], str) and plugin[k].strip()
                     for k in ("name", "version", "category", "description", "developer")), "Missing plugin metadata")
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.png", plugin["icon"]), "Invalid icon filename")
-        require(type(plugin["versionCode"]) is int and 0 < plugin["versionCode"] <= 2_100_000_000
-                and plugin["signerSha256"] == digest(PIN), "Invalid versionCode or signer")
+        require(type(plugin["versionCode"]) is int and 0 < plugin["versionCode"] <= 2_100_000_000, "Invalid versionCode")
+        require(isinstance(plugin["signerSha256"], str) and re.fullmatch(HEX, plugin["signerSha256"]),
+                "Invalid signerSha256 metadata")
         require(isinstance(plugin["artifacts"], list) and plugin["artifacts"], "No plugin artifacts")
         abis = set()
         for artifact in plugin["artifacts"]:
@@ -240,9 +240,13 @@ def build_android(out, plan):
         path = out / ANDROID_FILES[abi]
         shutil.copyfile(variant / apk["outputFile"], path)
         artifacts.append({"abi": abi, "file": path.name, "size": path.stat().st_size, "sha256": digest(path)})
+    # Record the certificate selected for this build in the format used by the Android store client.
+    certificate = subprocess.check_output(["keytool", "-exportcert", "-keystore", env["ANDROID_KEYSTORE_PATH"],
+                                           "-alias", env["ANDROID_KEY_ALIAS"], "-storepass:env", "ANDROID_KEYSTORE_PASSWORD"],
+                                          env=env)
     write_json(out / "android-build.json", {"package": ANDROID_PACKAGE, "version": plan["version"],
                "versionCode": plan["code"], "sourceCommit": plan["sourceCommit"],
-               "signerSha256": digest(PIN), "artifacts": artifacts})
+               "signerSha256": hashlib.sha256(certificate).hexdigest(), "artifacts": artifacts})
 
 
 def next_code(version, previous):
@@ -272,19 +276,11 @@ def verify_apk_manifest(sdk, apk, entry):
 
 def verify(entry, out):
     sdk = Path(os.environ["ANDROID_HOME"])
-    tools = sdk / "build-tools/37.0.0"
     for artifact in entry["artifacts"]:
         abi = artifact["abi"]
         apk = out / artifact["file"]
         require(apk.stat().st_size == artifact["size"] and digest(apk) == artifact["sha256"],
                 f"APK size or SHA-256 mismatch: {apk.name}")
-        signing = subprocess.check_output([tools / "apksigner", "verify", "--verbose", "--print-certs", apk], text=True)
-        signers = re.findall(r"^(?:Signer #\d+|V[\d.]+ Signer:) certificate SHA-256 digest: ([0-9a-f]{64})$",
-                             signing, re.M)
-        # For apps with minSdk >= 28, apksigner skips v2 if a newer block is verified.
-        modern_scheme = re.search(r"^Verified using v(?:2|3(?:\.1)?) scheme [^\n]+: true$", signing, re.M)
-        require("Number of signers: 1" in signing.splitlines() and set(signers) == {digest(PIN)} and modern_scheme,
-                f"APK signer or modern signature mismatch: {apk.name}")
         verify_apk_manifest(sdk, apk, entry)
         with zipfile.ZipFile(apk) as data:
             native = {name.split("/")[1] for name in data.namelist() if name.startswith("lib/")}

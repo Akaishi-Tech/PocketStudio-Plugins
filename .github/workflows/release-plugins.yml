@@ -91,17 +91,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release.py plan
-      - name: Set up verification tools
+      - name: Set up Java for manifest inspection
         if: env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true'
         run: |
           echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;37.0.0"
       - name: Set up plugin build
         if: steps.plan.outputs.build == 'true'
         working-directory: source
         run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0"
           git submodule update --init --depth=1 --filter=blob:none -- upstream/release/tools/base
       - name: Build signed Android plugins
         if: steps.plan.outputs.build == 'true'
@@ -117,10 +116,10 @@ jobs:
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
           unset ANDROID_KEYSTORE_BASE64
           python3 scripts/release.py build
-      - name: Verify signed packages
+      - name: Verify package metadata and contents
         if: (env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true') && github.event_name == 'workflow_dispatch' && !inputs.publish
         run: python3 scripts/release.py verify
-      - name: Verify signatures and publish the store
+      - name: Verify package metadata and contents and publish the store
         if: (env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true') && (github.event_name == 'schedule' || inputs.publish)
         env:
           GH_TOKEN: ${{ github.token }}

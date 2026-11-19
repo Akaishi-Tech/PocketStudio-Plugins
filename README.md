@@ -9,11 +9,11 @@ The plugin store in Pocket Studio reads the catalog from the `plugin-store` GitH
 | [AVF](plugins/avf/listing.json) | `com.hcgstudio.pocketstudio.avfplugin` | arm64-v8a, x86_64 |
 | [PRoot](plugins/proot/listing.json) | `com.hcgstudio.pocketstudio.prootplugin` | arm64-v8a, x86_64 |
 
-## Verify a signed workflow build
+## Verify a workflow build
 
-The main repository builds and signs the plugins in GitHub Actions. Update `SOURCE_COMMIT` in this repository to the commit built by a successful `build-all.yml` run on the source repository’s default branch. In **Release Pocket Studio plugins**, select **all** or an individual plugin and enter the source run ID. Leave **Publish verified artifacts to the plugin store** unchecked to run verification. The workflow downloads each `plugin-<id>` artifact and checks the source revision, package, ABI, signing certificate, payload identity, file size and SHA-256. If the repository token cannot read source artifacts, configure `SOURCE_ACTIONS_READ_TOKEN` with Actions read access to `Akaishi-Tech/PocketStudio`. [Store workflow](.github/workflows/release-plugins.yml) · [Source builds](https://github.com/Akaishi-Tech/PocketStudio/actions/workflows/build-all.yml)
+The main repository builds and signs the plugins in GitHub Actions. Update `SOURCE_COMMIT` in this repository to the commit built by a successful `build-all.yml` run on the source repository’s default branch. In **Release Pocket Studio plugins**, select **all** or an individual plugin and enter the source run ID. Leave **Publish verified artifacts to the plugin store** unchecked to run verification. The workflow downloads each `plugin-<id>` artifact and checks the source revision, package name and version, ABI, payload identity, file size and SHA-256. If the repository token cannot read source artifacts, configure `SOURCE_ACTIONS_READ_TOKEN` with Actions read access to `Akaishi-Tech/PocketStudio`. [Store workflow](.github/workflows/release-plugins.yml) · [Source builds](https://github.com/Akaishi-Tech/PocketStudio/actions/workflows/build-all.yml)
 
-Each source artifact contains `<id>-build.json` and one signed APK for each supported ABI. Its JSON records `package`, `version`, `versionCode`, `sourceCommit`, `signerSha256` and `artifacts`. Each APK record contains `abi`, `file`, `size` and `sha256`. Codex also records the packager’s `buildId`. The package version code must increase when the APK contents change.
+Each source artifact contains `<id>-build.json` and one signed APK for each supported ABI. Its JSON records `package`, `version`, `versionCode`, `sourceCommit`, `signerSha256` and `artifacts`. The publisher copies the build’s certificate fingerprint into the catalog for the Android client’s installation checks. Each APK record contains `abi`, `file`, `size` and `sha256`. Codex also records the packager’s `buildId`. The package version code must increase when the APK contents change.
 
 ## Publish
 

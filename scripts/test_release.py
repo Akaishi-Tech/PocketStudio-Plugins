@@ -27,6 +27,26 @@ class ManifestTests(unittest.TestCase):
                     r.verify_apk_manifest(sdk, apk, entry)
 
 
+    def test_apk_verification_checks_manifest_and_embedded_payload(self):
+        with TemporaryDirectory() as work, patch.dict(os.environ, ANDROID_HOME="/sdk"):
+            folder = Path(work)
+            apk = folder / "codex.apk"
+            build_id = "1" * 64
+            with zipfile.ZipFile(apk, "w") as archive:
+                archive.writestr("lib/x86_64/libcodex_app_server.so", b"test payload")
+                archive.writestr("assets/codex-version", "1.0.2")
+                archive.writestr("assets/codex-build", build_id)
+            artifact = dict(file=apk.name, abi="x86_64", size=apk.stat().st_size, sha256=r.digest(apk))
+            entry = dict(package=r.PACKAGE, version="1.0.2", versionCode=3, buildId=build_id, artifacts=[artifact])
+            with patch.object(r.subprocess, "check_output", return_value=f"{r.PACKAGE} 3 1.0.2\n") as runner:
+                r.verify(entry, folder)
+                runner.assert_called_once_with([Path("/sdk/cmdline-tools/latest/bin/apkanalyzer"),
+                                                "apk", "summary", apk], text=True)
+                entry["buildId"] = "2" * 64
+                with self.assertRaisesRegex(ValueError, "Codex payload identity mismatch"):
+                    r.verify(entry, folder)
+
+
 class LinuxImageTests(unittest.TestCase):
     def test_gzip_bytes_survive_apk_packaging(self):
         compressed = gzip.compress(b"Debian filesystem")
@@ -122,7 +142,7 @@ class PluginReleaseTests(unittest.TestCase):
 
     def inputs(self, plugin, code=2, content="example"):
         info = dict(package=r.listing(plugin)["package"], version="1.0.0", versionCode=code,
-                    sourceCommit=r.source_commit(), signerSha256=r.digest(r.PIN), artifacts=[])
+                    sourceCommit=r.source_commit(), signerSha256="a" * 64, artifacts=[])
         if plugin == "codex":
             info["buildId"] = "1" * 64
         for abi, name in r.abi_files(plugin).items():
@@ -203,6 +223,15 @@ class PluginReleaseTests(unittest.TestCase):
         info["artifacts"].pop()
         with self.assertRaisesRegex(ValueError, "avf ABI"):
             r.plugin_entry("avf", info)
+
+    def test_signer_is_metadata_from_the_build(self):
+        info = self.inputs("codex")
+        for fingerprint in ("0" * 64, "f" * 64):
+            info["signerSha256"] = fingerprint
+            self.assertEqual(r.plugin_entry("codex", info)["signerSha256"], fingerprint)
+        info["signerSha256"] = "not-a-sha256"
+        with self.assertRaisesRegex(ValueError, "signerSha256 metadata"):
+            r.plugin_entry("codex", info)
 
     def test_check_source_pin(self):
         info = self.inputs("avf")

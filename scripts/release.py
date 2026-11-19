@@ -407,8 +407,10 @@ def publish(gh, out, plugins=("codex",), require_pin=False):
         immutable_asset(gh, release, catalog, "Pocket Studio plugin catalog")
         pointer = f"PocketStudio-Catalog: {catalog.name} sha256={digest(catalog)}"
         body = CATALOG_POINTER.sub("", release.get("body") or "").rstrip()
-        gh.api(f"releases/{release['id']}", method="PATCH",
-               body={"body": (body + "\n\n" + pointer).strip(), "name": "", "draft": False, "make_latest": "true"})
+        changes = {"body": (body + "\n\n" + pointer).strip(), "draft": False, "make_latest": "true"}
+        if release.get("name"):
+            changes["name"] = ""
+        gh.api(f"releases/{release['id']}", method="PATCH", body=changes)
 
 
 def fetch_source_run(out, plugins):

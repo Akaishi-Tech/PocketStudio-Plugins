@@ -17,14 +17,8 @@ Each source artifact contains `<id>-build.json` and one signed APK for each supp
 
 ## Publish
 
-To publish an approved run, select the same source run and enable **Publish verified artifacts to the plugin store**. The workflow uploads immutable versioned APKs, plugin icons and build records, then switches the catalog pointer in a single release update. A release asset can be downloaded by name directly from the selected catalog. The workflow preserves previous catalog generations and the files they reference.
+To publish an approved run, select the same source run and enable **Publish verified artifacts to the plugin store**. The workflow verifies the selected plugins, uploads their versioned APKs, icons and build records, and checks that every catalog entry points to an uploaded icon and matching APKs. The store publishes one catalog named `plugin-store.json` with `schemaVersion` 2. [Download the catalog](https://github.com/Akaishi-Tech/PocketStudio-Plugins/releases/download/plugin-store/plugin-store.json)
 
-Each catalog has a name such as `plugin-store-v3.json`. The release body identifies the committed generation on a line with this format.
-
-```text
-PocketStudio-Catalog: plugin-store-v3.json sha256=<64 lowercase hex digits>
-```
-
-A legacy release can still supply `plugin-store.json` until a versioned catalog is committed. When publishing from such a release, unrelated plugin listings retain their existing filenames and digests. Catalog entries use `schemaVersion` 2.
+The publisher uploads and verifies the new catalog before switching the fixed filename. During the switch it holds the previous catalog under a temporary name so a failed promotion can be restored. Retrying an interrupted publish finishes cleanup. Older versioned plugin files remain available.
 
 The existing draft-release input accepts an `incoming-<id>-<versionCode>` staging tag for one plugin. The draft contains its signed APKs and matching build metadata, either with versioned public filenames or in the earlier staging format. The scheduled Codex and Android checks use the pinned source recipe if signing secrets are configured in this repository. [Verification and publication](scripts/release.py)

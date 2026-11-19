@@ -25,8 +25,8 @@ PIN = Path("release_signer.der")
 PLUGINS = ("codex", "android", "avf", "proot")
 TITLES = {"codex": "Codex", "android": "Android", "avf": "AVF", "proot": "PRoot"}
 SOURCE_REPO = "Akaishi-Tech/PocketStudio"
-CATALOG_POINTER = re.compile(r"^PocketStudio-Catalog: (plugin-store-v[1-9][0-9]*\.json) sha256=([a-f0-9]{64})$", re.M)
-CATALOG_FILENAME = re.compile(r"plugin-store-v([1-9][0-9]*)\.json")
+STAGED_CATALOG = "pending-plugin-store.json"
+BACKUP_CATALOG = "previous-plugin-store.json"
 ICON = Path("plugins/codex/Codex.png")
 SOURCE = Path("source")
 SCRIPT = SOURCE / "scripts/build-codex-plugin.py"
@@ -105,6 +105,9 @@ class GitHub:
         return json.loads(subprocess.check_output(["gh", "api", url, "--method", "POST",
                           "--header", "Content-Type: " + mime, "--input", str(path)]))
 
+    def rename(self, item, name):
+        return self.api(f"releases/assets/{item['id']}", method="PATCH", body={"name": name})
+
     def remove(self, item):
         self.api(f"releases/assets/{item['id']}", method="DELETE")
 
@@ -177,23 +180,13 @@ def validate_store(store):
 
 
 def previous_store(gh, release, out):
-    body = release.get("body") or ""
-    pointers = CATALOG_POINTER.findall(body)
-    if "PocketStudio-Catalog:" in body:
-        require(len(pointers) == 1 and body.count("PocketStudio-Catalog:") == 1, "Invalid or duplicate catalog pointer")
-        name, sha = pointers[0]
-        item = asset(release, name)
-        require(item and item.get("digest") == "sha256:" + sha and item["state"] == "uploaded",
-                "Committed catalog is missing or damaged")
-    else:
-        item = asset(release, MANIFEST)
-        if not item or item["state"] != "uploaded":
-            backups = [a for a in release.get("assets", []) if a["state"] == "uploaded"
-                       and re.fullmatch(r"previous-\d+-" + re.escape(MANIFEST), a["name"])]
-            item = max(backups, key=lambda a: a["id"], default=None)
-        if not item:
-            require(not release or release["draft"], "Published store catalog is missing")
-            return {"schemaVersion": 2, "plugins": []}
+    # A stopped publisher may have parked the previous catalog just before
+    # promoting the verified replacement. Planning is read-only in that window.
+    item = asset(release, MANIFEST) or asset(release, BACKUP_CATALOG)
+    if not item:
+        require(not release or release["draft"], "Published store catalog is missing")
+        return {"schemaVersion": 2, "plugins": []}
+    require(item["state"] == "uploaded", "Incomplete store catalog")
     require(0 < item["size"] <= 262144, "Invalid catalog size")
     dest = out / "previous-store.json"
     gh.download(item, dest)
@@ -372,8 +365,46 @@ def payloads(entry):
     return {a["abi"]: (a["sha256"], a["size"]) for a in entry["artifacts"]}
 
 
+def replace_catalog(gh, release, catalog):
+    # GitHub changes asset names individually. The workflow serializes writers.
+    # Restore a displaced catalog before starting (or retrying) another swap.
+    gh.assets(release)
+    current = asset(release, MANIFEST)
+    backup = asset(release, BACKUP_CATALOG)
+    staged = asset(release, STAGED_CATALOG)
+    if backup:
+        if current:
+            gh.remove(backup)
+        else:
+            current = gh.rename(backup, MANIFEST)
+    sha, size = digest(catalog), catalog.stat().st_size
+    if matches(current, sha, size):
+        if staged:
+            gh.remove(staged)
+        return
+    if not matches(staged, sha, size):
+        if staged:
+            gh.remove(staged)
+        staged = gh.upload(release["id"], catalog, STAGED_CATALOG, "Pocket Studio plugin catalog")
+        require(matches(staged, sha, size), "GitHub did not verify the staged catalog")
+    try:
+        if current:
+            gh.rename(current, BACKUP_CATALOG)
+        published = gh.rename(staged, MANIFEST)
+        require(matches(published, sha, size), "Published catalog digest mismatch")
+    except Exception:
+        # Read GitHub's state because a rename can succeed without a reply.
+        gh.assets(release)
+        backup = asset(release, BACKUP_CATALOG)
+        if backup and not asset(release, MANIFEST):
+            gh.rename(backup, MANIFEST)
+        raise
+    if current:
+        gh.remove(current)
+
+
 def publish(gh, out, plugins=("codex",), require_pin=False):
-    """Stage every immutable asset, then switch the single catalog pointer after all plugins verify."""
+    """Publish the fixed catalog only after its immutable assets have been verified."""
     selected = checked_inputs(out, plugins, require_pin)
     release, store, _ = current(gh, out)
     previous = {entry["package"]: entry for entry in store["plugins"]}
@@ -395,22 +426,26 @@ def publish(gh, out, plugins=("codex",), require_pin=False):
                        {**info, "artifacts": entry["artifacts"]})
             previous[entry["package"]] = entry
         updated = validate_store({"schemaVersion": 2, "plugins": list(previous.values())})
+        catalog = out / MANIFEST
+        write_json(catalog, updated)
+        require(catalog.stat().st_size <= 262144, "Store catalog exceeds the client size limit")
         if not release:
             release = gh.create(TAG, "Open the plugin store in Pocket Studio to install these packages.")
         for path in sorted(work.iterdir()):
             immutable_asset(gh, release, path, path.name)
-        if store == updated and CATALOG_POINTER.search(release.get("body") or "") and not release["draft"] and not release.get("name"):
-            return
-        generations = [int(match[1]) for row in release["assets"] if (match := CATALOG_FILENAME.fullmatch(row["name"]))]
-        catalog = work / f"plugin-store-v{max(generations, default=0) + 1}.json"
-        write_json(catalog, updated)
-        immutable_asset(gh, release, catalog, "Pocket Studio plugin catalog")
-        pointer = f"PocketStudio-Catalog: {catalog.name} sha256={digest(catalog)}"
-        body = CATALOG_POINTER.sub("", release.get("body") or "").rstrip()
-        changes = {"body": (body + "\n\n" + pointer).strip(), "draft": False, "make_latest": "true"}
-        if release.get("name"):
-            changes["name"] = ""
-        gh.api(f"releases/{release['id']}", method="PATCH", body=changes)
+        gh.assets(release)
+        for entry in updated["plugins"]:
+            icon = asset(release, entry["icon"])
+            require(icon and icon["state"] == "uploaded" and icon["size"] > 0, f"Missing plugin icon: {entry['icon']}")
+            for apk in entry["artifacts"]:
+                require(matches(asset(release, apk["file"]), apk["sha256"], apk["size"]),
+                        f"Missing or damaged release APK: {apk['file']}")
+        replace_catalog(gh, release, catalog)
+        if release["draft"] or release.get("name"):
+            changes = {"draft": False, "make_latest": "true"}
+            if release.get("name"):
+                changes["name"] = ""
+            gh.api(f"releases/{release['id']}", method="PATCH", body=changes)
 
 
 def fetch_source_run(out, plugins):

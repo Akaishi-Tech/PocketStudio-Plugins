@@ -1,0 +1,10 @@
+{
+  "package": "com.hcgstudio.pocketstudio.codexplugin",
+  "name": "Codex Plugin",
+  "names": {"zh": "Codex 插件"},
+  "category": "agent",
+  "developer": "Akaishi Tech",
+  "description": "Use Codex to navigate, edit and debug your Android project in Pocket Studio.",
+  "descriptions": {"zh": "在掌上 Studio 中使用 Codex 浏览、编辑和调试 Android 项目。"},
+  "icon": "Codex.png"
+}

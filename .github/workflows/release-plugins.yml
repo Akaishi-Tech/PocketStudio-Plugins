@@ -1,0 +1,88 @@
+name: Release Pocket Studio plugins
+on:
+  workflow_dispatch:
+    inputs:
+      staging_tag:
+        description: Optional draft tag with the signed per-ABI Codex APKs and codex-build.json
+        type: string
+        required: false
+  schedule:
+    - cron: '23 3 * * *'
+
+concurrency:
+  group: plugin-store-release
+  queue: max
+
+permissions: {}
+jobs:
+  release:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: write
+    env:
+      STAGING_TAG: ${{ inputs.staging_tag }}
+      CAN_SIGN: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select source and release mode
+        id: source
+        run: |
+          set -eu
+          commit=$(cat SOURCE_COMMIT)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          if [[ -n "$STAGING_TAG" || "$CAN_SIGN" == true ]]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo "::error::Select a signed staging draft or configure Android signing secrets."
+            exit 1
+          fi
+      - name: Check out pinned build recipe
+        if: steps.source.outputs.active == 'true' && env.STAGING_TAG == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Akaishi-Tech/PocketStudio
+          ref: ${{ steps.source.outputs.commit }}
+          path: source
+          persist-credentials: false
+      - name: Resolve release inputs
+        id: plan
+        if: steps.source.outputs.active == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py plan
+      - name: Set up verification tools
+        if: steps.plan.outputs.publish == 'true'
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;37.0.0"
+      - name: Set up plugin build
+        if: steps.plan.outputs.build == 'true'
+        working-directory: source
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0"
+          git submodule update --init --depth=1 --filter=blob:none -- upstream/release/tools/base
+      - name: Build signed Android plugins
+        if: steps.plan.outputs.build == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          umask 077
+          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/pocketstudio-release.keystore"
+          trap 'rm -f "$ANDROID_KEYSTORE_PATH"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          unset ANDROID_KEYSTORE_BASE64
+          python3 scripts/release.py build
+      - name: Verify signatures and publish the store
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py publish

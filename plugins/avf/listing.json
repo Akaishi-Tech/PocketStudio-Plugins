@@ -1,0 +1,11 @@
+{
+  "package": "com.hcgstudio.pocketstudio.avfplugin",
+  "name": "Debian Linux (AVF)",
+  "category": "development-environment",
+  "developer": "Akaishi Tech",
+  "description": "Run Debian projects in Android’s Linux Terminal with an offline development image and local SSH.",
+  "descriptions": {
+    "zh": "在系统 Linux 终端中使用内置 Debian 开发镜像和本机 SSH 运行通用项目。"
+  },
+  "icon": "AVF.png"
+}

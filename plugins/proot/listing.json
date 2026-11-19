@@ -1,0 +1,11 @@
+{
+  "package": "com.hcgstudio.pocketstudio.prootplugin",
+  "name": "Debian Linux (PRoot)",
+  "category": "development-environment",
+  "developer": "Akaishi Tech",
+  "description": "Run projects in a bundled Debian shell with PRoot on the device.",
+  "descriptions": {
+    "zh": "在设备上使用 PRoot 和内置 Debian 开发环境运行通用项目。"
+  },
+  "icon": "PRoot.png"
+}

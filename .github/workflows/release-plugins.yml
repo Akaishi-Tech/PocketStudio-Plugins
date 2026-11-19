@@ -5,8 +5,16 @@ on:
       plugin:
         description: Plugin to release
         type: choice
-        options: [codex, android]
+        options: [codex, android, avf, proot, all]
         default: codex
+      source_run_id:
+        description: Successful build-all run ID from the pinned PocketStudio commit
+        type: string
+        required: false
+      publish:
+        description: Publish verified artifacts to the plugin store
+        type: boolean
+        default: false
       staging_tag:
         description: Optional draft tag containing the signed plugin APKs and build metadata
         type: string
@@ -31,14 +39,18 @@ jobs:
     timeout-minutes: 100
     permissions:
       contents: write
+      actions: read
     env:
       PLUGIN: ${{ matrix.plugin }}
       STAGING_TAG: ${{ inputs.staging_tag }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       CAN_SIGN: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check release behavior
+        run: python3 -B scripts/test_release.py
       - name: Select source and release mode
         id: source
         run: |
@@ -46,28 +58,41 @@ jobs:
           commit=$(cat SOURCE_COMMIT)
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          if [[ -n "$STAGING_TAG" || "$CAN_SIGN" == true ]]; then
+          if [[ -n "$STAGING_TAG" && -n "$SOURCE_RUN_ID" ]]; then
+            echo "::error::Select either source_run_id or staging_tag."
+            exit 1
+          fi
+          if [[ "$PLUGIN" == all && -z "$SOURCE_RUN_ID" ]]; then
+            echo "::error::Select a successful source build-all run to verify all plugins."
+            exit 1
+          fi
+          if [[ -n "$SOURCE_RUN_ID" || -n "$STAGING_TAG" || "$CAN_SIGN" == true ]]; then
             echo "active=true" >> "$GITHUB_OUTPUT"
           elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            echo "::error::Select a signed staging draft or configure Android signing secrets."
+            echo "::error::Select a signed source run or a signed staging draft."
             exit 1
           fi
       - name: Check out pinned build recipe
-        if: steps.source.outputs.active == 'true' && env.STAGING_TAG == ''
+        if: steps.source.outputs.active == 'true' && env.STAGING_TAG == '' && env.SOURCE_RUN_ID == ''
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Akaishi-Tech/PocketStudio
           ref: ${{ steps.source.outputs.commit }}
           path: source
           persist-credentials: false
+      - name: Download signed artifacts from the pinned source run
+        if: env.SOURCE_RUN_ID != ''
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_ACTIONS_READ_TOKEN || github.token }}
+        run: python3 scripts/release.py fetch
       - name: Resolve release inputs
         id: plan
-        if: steps.source.outputs.active == 'true'
+        if: steps.source.outputs.active == 'true' && env.SOURCE_RUN_ID == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release.py plan
       - name: Set up verification tools
-        if: steps.plan.outputs.publish == 'true'
+        if: env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true'
         run: |
           echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
@@ -92,8 +117,11 @@ jobs:
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
           unset ANDROID_KEYSTORE_BASE64
           python3 scripts/release.py build
+      - name: Verify signed packages
+        if: (env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true') && github.event_name == 'workflow_dispatch' && !inputs.publish
+        run: python3 scripts/release.py verify
       - name: Verify signatures and publish the store
-        if: steps.plan.outputs.publish == 'true'
+        if: (env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true') && (github.event_name == 'schedule' || inputs.publish)
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release.py publish

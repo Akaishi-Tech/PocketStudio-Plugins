@@ -1,26 +1,30 @@
 # Pocket Studio Plugins
 
-Pocket Studio reads the versioned plugin catalog from the `plugin-store` release. Open **Plugin store** on the home screen to browse listings and install the APK for your device. The Codex plugin retains the Android package name `com.hcgstudio.pocketstudio.codexplugin` and ships separate ARM64 and x86_64 APKs. [Plugin store release](https://github.com/Akaishi-Tech/PocketStudio-Plugins/releases/tag/plugin-store) · [Pocket Studio app](https://github.com/Akaishi-Tech/PocketStudio/releases)
+The plugin store in Pocket Studio reads the catalog from the `plugin-store` GitHub release. The four listings in this repository describe the Android environment, the Codex agent, and two alternative Debian environments. [Plugin store](https://github.com/Akaishi-Tech/PocketStudio-Plugins/releases/tag/plugin-store) · [Pocket Studio](https://github.com/Akaishi-Tech/PocketStudio)
 
-## Publish the Android development environment
+| Plugin | Android package | Architectures |
+| --- | --- | --- |
+| [Android](plugins/android/listing.json) | `com.hcgstudio.pocketstudio.androidplugin` | arm64-v8a, armeabi-v7a, x86_64, x86 |
+| [Codex](plugins/codex/listing.json) | `com.hcgstudio.pocketstudio.codexplugin` | arm64-v8a, x86_64 |
+| [AVF](plugins/avf/listing.json) | `com.hcgstudio.pocketstudio.avfplugin` | arm64-v8a, x86_64 |
+| [PRoot](plugins/proot/listing.json) | `com.hcgstudio.pocketstudio.prootplugin` | arm64-v8a, x86_64 |
 
-Select **android** in **Release Pocket Studio plugins** to build the pinned Pocket Studio revision. The Android environment appears under **Development environments** and ships ARM64, ARMv7, x86 and x86_64 APKs. The publisher verifies each APK and updates its listing in the shared catalog. The daily workflow also checks the Android source pin. [Android listing](android.json)
+## Verify a signed workflow build
 
-## Publish Codex
+The main repository builds and signs the plugins in GitHub Actions. Update `SOURCE_COMMIT` in this repository to the commit built by a successful `build-all.yml` run on the source repository’s default branch. In **Release Pocket Studio plugins**, select **all** or an individual plugin and enter the source run ID. Leave **Publish verified artifacts to the plugin store** unchecked to run verification. The workflow downloads each `plugin-<id>` artifact and checks the source revision, package, ABI, signing certificate, payload identity, file size and SHA-256. If the repository token cannot read source artifacts, configure `SOURCE_ACTIONS_READ_TOKEN` with Actions read access to `Akaishi-Tech/PocketStudio`. [Store workflow](.github/workflows/release-plugins.yml) · [Source builds](https://github.com/Akaishi-Tech/PocketStudio/actions/workflows/build-all.yml)
 
-`SOURCE_COMMIT` pins the Pocket Studio source revision containing the plugin and packaging recipe. `codex.json` and `icons/Codex.png` supply the store listing. The publisher verifies the package, Android version, signing certificate, build ID, native ABI, size and SHA-256 digest of each APK. It uploads the two APKs and the icon before publishing the v2 catalog and preserves other plugins’ listings. [Publishing workflow](.github/workflows/release-plugins.yml)
+Each source artifact contains `<id>-build.json` and one signed APK for each supported ABI. Its JSON records `package`, `version`, `versionCode`, `sourceCommit`, `signerSha256` and `artifacts`. Each APK record contains `abi`, `file`, `size` and `sha256`. Codex also records the packager’s `buildId`. The package version code must increase when the APK contents change.
 
-To release locally signed packages, run the packager for the pinned source and assign a version code greater than the published Codex build. It produces `codex-build.json` and the two APKs. Upload those three files to a draft release, then select that staging tag in **Release Pocket Studio plugins**. The staging workflow uses the public signing certificate checked into this repository. [Build instructions](https://github.com/Akaishi-Tech/PocketStudio/tree/main/build-support/codex-plugin)
+## Publish
 
-```sh
-tag="incoming-codex-$PLUGIN_VERSION_CODE"
-gh release create "$tag" --draft --title "Codex staging $PLUGIN_VERSION_CODE" --notes "Signed ABI artifacts" \
-  "$OUT/codex-build.json" "$OUT/PocketStudio-Codex-Plugin-arm64-v8a.apk" "$OUT/PocketStudio-Codex-Plugin-x86_64.apk"
-gh workflow run release-plugins.yml -f staging_tag="$tag"
+To publish an approved run, select the same source run and enable **Publish verified artifacts to the plugin store**. The workflow uploads immutable versioned APKs, plugin icons and build records, then switches the catalog pointer in a single release update. A release asset can be downloaded by name directly from the selected catalog. The workflow preserves previous catalog generations and the files they reference.
+
+Each catalog has a name such as `plugin-store-v3.json`. The release body identifies the committed generation on a line with this format.
+
+```text
+PocketStudio-Catalog: plugin-store-v3.json sha256=<64 lowercase hex digits>
 ```
 
-With the Android signing secrets configured, a manual dispatch with an empty staging tag builds from `SOURCE_COMMIT`. The daily check at 03:23 UTC uses that same mode. It rebuilds when the upstream Codex package, packaging inputs or listing change. The signing job reads `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` as Actions secrets.
+A legacy release can still supply `plugin-store.json` until a versioned catalog is committed. When publishing from such a release, unrelated plugin listings retain their existing filenames and digests. Catalog entries use `schemaVersion` 2.
 
-## Catalog format
-
-`plugin-store.json` uses `schemaVersion: 2` and a `plugins` array. First-party entries use the `com.hcgstudio.pocketstudio.` package prefix. Each entry declares a category, publisher, description, display name, icon asset, Android version, version code and signer fingerprint. Optional `names` and `descriptions` maps provide localized text. Each item in `artifacts` provides the ABI, release filename, byte size and SHA-256. [Codex listing](codex.json)
+The existing draft-release input accepts an `incoming-<id>-<versionCode>` staging tag for one plugin. The draft contains its signed APKs and matching build metadata, either with versioned public filenames or in the earlier staging format. The scheduled Codex and Android checks use the pinned source recipe if signing secrets are configured in this repository. [Verification and publication](scripts/release.py)

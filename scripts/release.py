@@ -399,7 +399,7 @@ def publish(gh, out, plugins=("codex",), require_pin=False):
             release = gh.create(TAG, "Open the plugin store in Pocket Studio to install these packages.")
         for path in sorted(work.iterdir()):
             immutable_asset(gh, release, path, path.name)
-        if store == updated and CATALOG_POINTER.search(release.get("body") or "") and not release["draft"]:
+        if store == updated and CATALOG_POINTER.search(release.get("body") or "") and not release["draft"] and not release.get("name"):
             return
         generations = [int(match[1]) for row in release["assets"] if (match := CATALOG_FILENAME.fullmatch(row["name"]))]
         catalog = work / f"plugin-store-v{max(generations, default=0) + 1}.json"
@@ -408,7 +408,7 @@ def publish(gh, out, plugins=("codex",), require_pin=False):
         pointer = f"PocketStudio-Catalog: {catalog.name} sha256={digest(catalog)}"
         body = CATALOG_POINTER.sub("", release.get("body") or "").rstrip()
         gh.api(f"releases/{release['id']}", method="PATCH",
-               body={"body": (body + "\n\n" + pointer).strip(), "draft": False, "make_latest": "true"})
+               body={"body": (body + "\n\n" + pointer).strip(), "name": "", "draft": False, "make_latest": "true"})
 
 
 def fetch_source_run(out, plugins):

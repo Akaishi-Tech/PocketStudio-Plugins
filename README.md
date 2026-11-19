@@ -1,6 +1,6 @@
 # Pocket Studio Plugins
 
-Pocket Studio reads the versioned plugin catalog from the `plugin-store` release. Open **Settings → Plugins** in the app to browse listings and install the APK for your device. The Codex plugin retains the Android package name `com.hcgstudio.pocketstudio.codexplugin` and ships separate ARM64 and x86_64 APKs. [Plugin store release](https://github.com/Akaishi-Tech/PocketStudio-Plugins/releases/tag/plugin-store) · [Pocket Studio app](https://github.com/Akaishi-Tech/PocketStudio/releases)
+Pocket Studio reads the versioned plugin catalog from the `plugin-store` release. Open **Settings → Plugin store** in the app to browse listings and install the APK for your device. The Codex plugin retains the Android package name `com.hcgstudio.pocketstudio.codexplugin` and ships separate ARM64 and x86_64 APKs. [Plugin store release](https://github.com/Akaishi-Tech/PocketStudio-Plugins/releases/tag/plugin-store) · [Pocket Studio app](https://github.com/Akaishi-Tech/PocketStudio/releases)
 
 ## Publish Codex
 

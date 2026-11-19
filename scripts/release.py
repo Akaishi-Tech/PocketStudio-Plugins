@@ -265,7 +265,7 @@ def publish(gh, out):
     require(ICON.name == entry["icon"], "Catalog icon missing")
     write_json(out / MANIFEST, validate_store(store))
     if not release:
-        release = gh.create(TAG, "Pocket Studio Plugin Store", "Install plugins from **Settings → Plugins** in Pocket Studio.")
+        release = gh.create(TAG, "Pocket Studio Plugin Store", "Install plugins from **Settings → Plugin store** in Pocket Studio.")
     rid = release["id"]
     for a in entry["artifacts"]:
         replace_asset(gh, rid, out / a["file"], f"Codex {entry['version']} ({entry['versionCode']}) · {a['abi']}")

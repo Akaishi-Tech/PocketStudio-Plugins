@@ -140,9 +140,15 @@ class PluginReleaseTests(unittest.TestCase):
         self.enterContext(patch.object(r, "verify"))
         self.enterContext(patch.dict(os.environ, STAGING_TAG="", GITHUB_SHA="a" * 40))
 
+    def run_record(self, number=1, attempt=1):
+        return dict(id=900000 + number, run_number=number, run_attempt=attempt, head_sha="a" * 40,
+                    repository={"full_name": r.SOURCE_REPO}, head_repository={"full_name": r.SOURCE_REPO},
+                    status="completed", conclusion="success", head_branch="main", event="push",
+                    path=".github/workflows/build-all.yml")
+
     def inputs(self, plugin, code=2, content="example"):
         info = dict(package=r.listing(plugin)["package"], version="1.0.0", versionCode=code,
-                    sourceCommit=r.source_commit(), signerSha256="a" * 64, artifacts=[])
+                    sourceCommit="a" * 40, signerSha256="a" * 64, artifacts=[])
         if plugin == "codex":
             info["buildId"] = "1" * 64
         for abi, name in r.abi_files(plugin).items():
@@ -155,7 +161,7 @@ class PluginReleaseTests(unittest.TestCase):
     def test_all_publish_versioned_and_retry(self):
         for plugin in r.PLUGINS:
             self.inputs(plugin)
-        r.publish(self.gh, self.out, r.PLUGINS, True)
+        r.publish(self.gh, self.out, r.PLUGINS, self.run_record())
         release, store, _ = r.current(self.gh, self.out)
         self.assertNotIn("name", release)
         self.assertEqual({p["package"] for p in store["plugins"]}, {r.listing(k)["package"] for k in r.PLUGINS})
@@ -200,7 +206,8 @@ class PluginReleaseTests(unittest.TestCase):
         self.assertIn(original["plugins"][0], store["plugins"])
         self.assertFalse(r.asset(release, r.BACKUP_CATALOG))
         self.assertFalse(r.asset(release, r.STAGED_CATALOG))
-        self.assertFalse(r.prepare(self.gh, self.out, "android")["publish"])
+        with patch.object(r.subprocess, "check_output", return_value="a" * 40):
+            self.assertFalse(r.prepare(self.gh, self.out, "android")["publish"])
 
     def test_missing_existing_artifact_prevents_catalog_change(self):
         self.inputs("codex")
@@ -233,12 +240,64 @@ class PluginReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "signerSha256 metadata"):
             r.plugin_entry("codex", info)
 
-    def test_check_source_pin(self):
+    def test_check_artifact_provenance(self):
         info = self.inputs("avf")
         info["sourceCommit"] = "b" * 40
         r.write_json(self.out / "avf-build.json", info)
         with self.assertRaisesRegex(ValueError, "Wrong source commit"):
-            r.checked_inputs(self.out, ["avf"], True)
+            r.checked_inputs(self.out, ["avf"], self.run_record())
+
+    def test_completed_source_runs_and_retries(self):
+        latest = self.run_record(10)
+        self.inputs("codex", code=4)
+        with patch.object(r, "resolve_source_run", return_value=latest):
+            self.assertEqual(r.select(self.gh, self.out, ["codex"], "")["changed"], "true")
+            r.publish(self.gh, self.out, ["codex"], latest)
+            self.assertEqual(r.select(self.gh, self.out, ["codex"], "")["changed"], "false")
+        release, _, entry = r.current(self.gh, self.out)
+        self.assertEqual((entry["sourceRunNumber"], entry["sourceRunId"], entry["sourceRunAttempt"]), (10, 900010, 1))
+        self.inputs("codex", code=2, content="stale")
+        r.publish(self.gh, self.out, ["codex"], self.run_record(9))
+        self.assertEqual(release, self.gh.releases()[0])
+        with patch.object(r, "resolve_source_run", return_value=self.run_record(10, 2)):
+            self.assertEqual(r.select(self.gh, self.out, ["codex"], "")["changed"], "true")
+
+    def test_selects_successful_default_branch_source_runs(self):
+        newest = self.run_record(12)
+        failed = {**self.run_record(14), "conclusion": "failure"}
+        other = {**self.run_record(13), "head_repository": {"full_name": "some/fork"}}
+        with patch.object(r, "source_api", side_effect=[
+                {"default_branch": "main"}, {"workflow_runs": [failed, other, newest, self.run_record(11)]}]):
+            self.assertEqual(r.resolve_source_run("latest"), newest)
+        with patch.object(r, "source_api", side_effect=[{"default_branch": "main"}, other]):
+            with self.assertRaisesRegex(ValueError, "default branch"):
+                r.resolve_source_run(str(other["id"]))
+        with patch.object(r, "source_api", side_effect=[{"default_branch": "main"}, {"workflow_runs": []}]):
+            self.assertIsNone(r.resolve_source_run(""))
+
+    def test_listing_only_updates_description_and_icon_without_new_apks(self):
+        self.inputs("avf")
+        r.publish(self.gh, self.out, ["avf"], self.run_record(4))
+        release, _, before = r.current(self.gh, self.out, r.PREFIX + "avfplugin")
+        metadata = r.listing("avf")
+        updated = dict(metadata, description="A new description")
+        with patch.object(r, "listing", return_value=updated):
+            r.update_listings(self.gh, self.out, ["avf"])
+        release, store, after = r.current(self.gh, self.out, before["package"])
+        self.assertEqual(after, dict(before, description="A new description"))
+        replacement = self.out / "updated.png"
+        replacement.write_bytes(b"Different icon")
+        with patch.object(r, "icon_path", return_value=replacement), patch.object(r, "listing", return_value=updated):
+            r.update_listings(self.gh, self.out, ["avf"])
+            changed, _, after = r.current(self.gh, self.out, before["package"])
+            self.assertRegex(after["icon"], r"^AVF-1\.0\.0-2-[0-9a-f]{16}\.png$")
+            self.assertEqual(after["artifacts"], before["artifacts"])
+            self.assertEqual(after["sourceRunId"], before["sourceRunId"])
+            self.assertTrue(r.matches(r.asset(changed, after["icon"]), r.digest(replacement), replacement.stat().st_size))
+            self.assertEqual({a["id"] for a in release["assets"] if a["name"].endswith(".apk")},
+                             {a["id"] for a in changed["assets"] if a["name"].endswith(".apk")})
+            r.update_listings(self.gh, self.out, ["avf"])
+            self.assertEqual(changed, self.gh.releases()[0])
 
 
 if __name__ == "__main__":

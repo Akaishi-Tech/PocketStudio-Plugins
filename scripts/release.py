@@ -26,7 +26,6 @@ TITLES = {"codex": "Codex", "android": "Android", "avf": "AVF", "proot": "PRoot"
 SOURCE_REPO = "Akaishi-Tech/PocketStudio"
 STAGED_CATALOG = "pending-plugin-store.json"
 BACKUP_CATALOG = "previous-plugin-store.json"
-ICON = Path("plugins/codex/Codex.png")
 SOURCE = Path("source")
 SCRIPT = SOURCE / "scripts/build-codex-plugin.py"
 HEX = r"[0-9a-f]{64}"
@@ -126,14 +125,13 @@ def immutable_asset(gh, release, path):
     release["assets"].append(item)
 
 
-def source_commit():
-    value = Path("SOURCE_COMMIT").read_text().strip()
-    require(re.fullmatch(r"[a-f0-9]{40}", value), "Invalid source pin")
-    return value
-
-
 def listing(plugin):
-    return read_json(Path("plugins") / plugin / "listing.json")
+    descriptor = read_json(Path("plugins") / plugin / "listing.json")
+    permitted = {"package", "name", "names", "category", "description", "descriptions", "developer", "icon"}
+    require(set(descriptor) <= permitted and descriptor["package"] == f"{PREFIX}{plugin}plugin",
+            f"Invalid listing: {plugin}")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.png", descriptor["icon"]), "Invalid listing icon")
+    return descriptor
 
 
 def icon_path(plugin):
@@ -339,10 +337,9 @@ def prepare(gh, out, plugin="codex"):
 
     require(plugin in ("codex", "android"), "AVF and PRoot use signed artifacts from the source build workflow")
     if android:
-        source_commit = Path("SOURCE_COMMIT").read_text().strip()
-        icon = icon_path(plugin)
-        if (previous and not release["draft"] and previous["sourceCommit"] == source_commit and
-                previous == public_entry(plugin, previous) and matches(asset(release, previous["icon"]), digest(icon), icon.stat().st_size)
+        source_commit = subprocess.check_output(["git", "-C", SOURCE, "rev-parse", "HEAD"], text=True).strip()
+        require(re.fullmatch(r"[a-f0-9]{40}", source_commit), "Invalid source checkout")
+        if (previous and not release["draft"] and previous["sourceCommit"] == source_commit
                 and all(matches(asset(release, a["file"]), a["sha256"], a["size"]) for a in previous["artifacts"])):
             return {"publish": False, "build": False}
         code = previous["versionCode"] + 1 if previous else 1
@@ -352,20 +349,19 @@ def prepare(gh, out, plugin="codex"):
     lock = read_json(out / "lock.json")
     if previous:
         require(version_components(lock["version"]) >= version_components(previous["version"]), "Upstream downgrade")
-        if (not release["draft"] and previous["buildId"] == lock["buildId"] and previous == public_entry(plugin, previous)
-                and matches(asset(release, previous["icon"]), digest(ICON), ICON.stat().st_size)
+        if (not release["draft"] and previous["buildId"] == lock["buildId"]
                 and all(matches(asset(release, a["file"]), a["sha256"], a["size"]) for a in previous["artifacts"])):
             return {"publish": False, "build": False}
     return {"publish": True, "build": True, "code": next_code(lock["version"], previous)}
 
 
-def checked_inputs(out, plugins, require_pin):
+def checked_inputs(out, plugins, run=None):
     selected = []
     for plugin in plugins:
         info = read_json(out / f"{plugin}-build.json")
         entry = plugin_entry(plugin, info)
-        if require_pin:
-            require(entry.get("sourceCommit") == source_commit(), f"Wrong source commit in {plugin} build")
+        if run:
+            require(entry.get("sourceCommit") == run["head_sha"], f"Wrong source commit in {plugin} build")
         verify(entry, out)
         selected.append((plugin, info, public_entry(plugin, info)))
     return selected
@@ -415,64 +411,160 @@ def replace_catalog(gh, release, catalog):
         gh.remove(current)
 
 
-def publish(gh, out, plugins=("codex",), require_pin=False):
+def stage_icon(release, work, plugin, entry, old):
+    path = icon_path(plugin)
+    sha, size = digest(path), path.stat().st_size
+    standard = f"{TITLES[plugin]}-{entry['version']}-{entry['versionCode']}.png"
+    if old and old["versionCode"] == entry["versionCode"] and matches(asset(release, old["icon"]), sha, size):
+        entry["icon"] = old["icon"]
+        return
+    existing = asset(release, standard)
+    if existing and not matches(existing, sha, size):
+        entry["icon"] = f"{standard[:-4]}-{sha[:16]}.png"
+    else:
+        entry["icon"] = standard
+    shutil.copyfile(path, work / entry["icon"])
+
+
+def publish_catalog(gh, release, out, entries, work):
+    updated = validate_store({"schemaVersion": 2, "plugins": list(entries)})
+    catalog = out / MANIFEST
+    write_json(catalog, updated)
+    require(catalog.stat().st_size <= 262144, "Store catalog exceeds the client size limit")
+    if not release:
+        release = gh.create(TAG, "Open the plugin store in Pocket Studio to install these packages.")
+    for path in sorted(work.iterdir()):
+        immutable_asset(gh, release, path)
+    gh.assets(release)
+    for entry in updated["plugins"]:
+        icon = asset(release, entry["icon"])
+        require(icon and icon["state"] == "uploaded" and icon["size"] > 0, f"Missing plugin icon: {entry['icon']}")
+        for apk in entry["artifacts"]:
+            require(matches(asset(release, apk["file"]), apk["sha256"], apk["size"]),
+                    f"Missing or damaged release APK: {apk['file']}")
+    replace_catalog(gh, release, catalog)
+    if release["draft"] or release.get("name"):
+        changes = {"draft": False, "make_latest": "true"}
+        if release.get("name"):
+            changes["name"] = ""
+        gh.api(f"releases/{release['id']}", method="PATCH", body=changes)
+
+
+def update_listings(gh, out, plugins):
+    release, store, _ = current(gh, out)
+    if not release:
+        return
+    by_package = {p["package"]: p for p in store["plugins"]}
+    with TemporaryDirectory(dir=out) as directory:
+        work = Path(directory)
+        for plugin in plugins:
+            descriptor = listing(plugin)
+            old = by_package.get(descriptor["package"])
+            if not old:
+                continue  # A new plugin becomes installable when its first APK is published.
+            # Remove optional old translations that were deleted from the current listing.
+            entry = {k: v for k, v in old.items() if k not in ("names", "descriptions")}
+            entry.update(descriptor)
+            stage_icon(release, work, plugin, entry, old)
+            by_package[entry["package"]] = entry
+        publish_catalog(gh, release, out, by_package.values(), work)
+
+
+def published_run(entry):
+    return (entry.get("sourceRunNumber", 0), entry.get("sourceRunId", 0), entry.get("sourceRunAttempt", 0))
+
+
+def selected_run(run):
+    return (run["run_number"], run["id"], run["run_attempt"])
+
+
+def publish(gh, out, plugins=("codex",), run=None):
     """Publish the fixed catalog only after its immutable assets have been verified."""
-    selected = checked_inputs(out, plugins, require_pin)
+    selected = checked_inputs(out, plugins, run)
     release, store, _ = current(gh, out)
     previous = {entry["package"]: entry for entry in store["plugins"]}
     with TemporaryDirectory(dir=out) as directory:
         work = Path(directory)
         for plugin, info, entry in selected:
             old = previous.get(entry["package"])
+            if old and run and published_run(old) > selected_run(run):
+                continue
             if old:
+                if run and entry["versionCode"] < old["versionCode"]:
+                    continue  # An older build also predates releases without a run marker.
                 require(version_components(entry["version"]) >= version_components(old["version"]), "Version downgrade")
                 require(entry["versionCode"] > old["versionCode"] or
-                        (entry["versionCode"] == old["versionCode"] and
-                         payloads(entry) == payloads(old)),
+                        (entry["versionCode"] == old["versionCode"] and payloads(entry) == payloads(old)),
                         "A changed APK requires a newer versionCode")
+            if run:
+                entry.update(sourceRunNumber=run["run_number"], sourceRunId=run["id"], sourceRunAttempt=run["run_attempt"])
+            elif old and old["versionCode"] == entry["versionCode"]:
+                entry.update({k: old[k] for k in ("sourceRunNumber", "sourceRunId", "sourceRunAttempt") if k in old})
             src_files = {a["abi"]: a["file"] for a in info["artifacts"]}
             for artifact in entry["artifacts"]:
                 os.link(out / src_files[artifact["abi"]], work / artifact["file"])
-            shutil.copyfile(icon_path(plugin), work / entry["icon"])
+            stage_icon(release, work, plugin, entry, old)
             write_json(work / f"{plugin}-build-{entry['version']}-{entry['versionCode']}.json",
                        {**info, "artifacts": entry["artifacts"]})
             previous[entry["package"]] = entry
-        updated = validate_store({"schemaVersion": 2, "plugins": list(previous.values())})
-        catalog = out / MANIFEST
-        write_json(catalog, updated)
-        require(catalog.stat().st_size <= 262144, "Store catalog exceeds the client size limit")
-        if not release:
-            release = gh.create(TAG, "Open the plugin store in Pocket Studio to install these packages.")
-        for path in sorted(work.iterdir()):
-            immutable_asset(gh, release, path)
-        gh.assets(release)
-        for entry in updated["plugins"]:
-            icon = asset(release, entry["icon"])
-            require(icon and icon["state"] == "uploaded" and icon["size"] > 0, f"Missing plugin icon: {entry['icon']}")
-            for apk in entry["artifacts"]:
-                require(matches(asset(release, apk["file"]), apk["sha256"], apk["size"]),
-                        f"Missing or damaged release APK: {apk['file']}")
-        replace_catalog(gh, release, catalog)
-        if release["draft"] or release.get("name"):
-            changes = {"draft": False, "make_latest": "true"}
-            if release.get("name"):
-                changes["name"] = ""
-            gh.api(f"releases/{release['id']}", method="PATCH", body=changes)
+        publish_catalog(gh, release, out, previous.values(), work)
+
+
+def source_api(path):
+    return json.loads(subprocess.check_output(["gh", "api", f"repos/{SOURCE_REPO}" + path]))
+
+
+def resolve_source_run(requested):
+    branch = source_api("")["default_branch"]
+    def supported(run):
+        return ((run.get("repository") or {}).get("full_name") == SOURCE_REPO
+                and (run.get("head_repository") or {}).get("full_name") == SOURCE_REPO
+                and all(type(run.get(k)) is int and run[k] > 0 for k in ("id", "run_number", "run_attempt"))
+                and run["head_branch"] == branch and re.fullmatch(r"[0-9a-f]{40}", run["head_sha"])
+                and run["path"] == ".github/workflows/build-all.yml"
+                and run["event"] in ("workflow_dispatch", "push")
+                and run["status"] == "completed" and run["conclusion"] == "success")
+
+    if not requested or requested == "latest":
+        query = urlencode({"branch": branch, "status": "success", "per_page": 100})
+        page = 1
+        while True:
+            runs = source_api(f"/actions/workflows/build-all.yml/runs?{query}&page={page}")["workflow_runs"]
+            eligible = [run for run in runs if supported(run)]
+            if eligible:
+                return max(eligible, key=selected_run)
+            if len(runs) < 100:
+                return None
+            page += 1
+    require(re.fullmatch(r"[1-9][0-9]{0,19}", requested), "Invalid source workflow run ID")
+    run = source_api(f"/actions/runs/{requested}")
+    require(supported(run), "Choose a successful build-all run from the source repository's default branch")
+    return run
+
+
+def select(gh, out, plugins, requested):
+    run = resolve_source_run(requested)
+    if not run:
+        return {"run_id": "", "commit": "", "changed": "false"}
+    release, store, _ = current(gh, out)
+    by_package = {e["package"]: e for e in store["plugins"]}
+    changed = any(selected_run(run) > published_run(by_package.get(listing(p)["package"], {})) for p in plugins)
+    if release.get("draft") or asset(release, BACKUP_CATALOG) or asset(release, STAGED_CATALOG):
+        changed = True
+    write_json(out / "source-run.json", run)
+    return {"run_id": str(run["id"]), "commit": run["head_sha"], "changed": str(changed).lower()}
 
 
 def fetch_source_run(out, plugins):
-    run_id = os.environ["SOURCE_RUN_ID"]
-    require(re.fullmatch(r"[1-9][0-9]{0,19}", run_id), "Invalid source workflow run ID")
-    root = f"repos/{SOURCE_REPO}"
-    def read(path):
-        return json.loads(subprocess.check_output(["gh", "api", path]))
-    run = read(f"{root}/actions/runs/{run_id}")
-    branch = read(root)["default_branch"]
-    require(run["repository"]["full_name"] == run["head_repository"]["full_name"] == SOURCE_REPO
-            and run["head_branch"] == branch and run["head_sha"] == source_commit()
-            and run["path"] == ".github/workflows/build-all.yml" and run["event"] in ("workflow_dispatch", "push")
-            and run["status"] == "completed" and run["conclusion"] == "success",
-            "Choose a successful build-all run of the pinned source on the default branch")
+    # Re-read GitHub's record; a rerun may have started since the selection step.
+    record = out / "source-run.json"
+    requested = str(read_json(record)["id"]) if record.is_file() else os.environ.get("SOURCE_RUN_ID", "")
+    run = resolve_source_run(requested)
+    require(run, "No successful source build is available")
+    if record.is_file():
+        require(selected_run(run) == selected_run(read_json(record)), "Source workflow was rerun during selection")
+    write_json(record, run)
+    run_id = str(run["id"])
     for plugin in plugins:
         with TemporaryDirectory(dir=out) as directory:
             download = Path(directory)
@@ -482,13 +574,17 @@ def fetch_source_run(out, plugins):
             require(metadata.is_file() and not metadata.is_symlink() and metadata.stat().st_size <= 262144,
                     f"Missing or invalid source metadata for {plugin}")
             entry = plugin_entry(plugin, read_json(metadata))
-            require(entry.get("sourceCommit") == source_commit(), "Source artifact metadata does not match pin")
+            require(entry.get("sourceCommit") == run["head_sha"], "Source artifact metadata does not match its workflow commit")
             files = {metadata.name, *(a["file"] for a in entry["artifacts"])}
             require({file.name for file in download.iterdir()} == files, f"Unexpected files in plugin-{plugin}")
             for name in files:
                 path = download / name
                 require(path.is_file() and not path.is_symlink(), f"Unexpected file type in plugin-{plugin}")
                 path.replace(out / name)
+    # Downloads of all four images can span a manual rerun of the same workflow ID.
+    finished = resolve_source_run(run_id)
+    require(selected_run(finished) == selected_run(run) and finished["head_sha"] == run["head_sha"],
+            "Source workflow was rerun while fetching artifacts")
 
 
 def main():
@@ -498,12 +594,21 @@ def main():
     selected = PLUGINS if plugin == "all" else (plugin,)
     out = Path(os.environ["RUNNER_TEMP"]) / "plugin-release"
     out.mkdir(exist_ok=True)
-    if command == "fetch":
+    record = out / "source-run.json"
+    if command == "select":
+        result = select(GitHub(), out, selected, os.environ.get("SOURCE_RUN_ID", ""))
+        print(f"Source run {result['run_id'] or 'unavailable'}, changed={result['changed']}")
+        with open(os.environ["GITHUB_OUTPUT"], "a") as outputs:
+            for key, value in result.items():
+                print(f"{key}={value}", file=outputs)
+    elif command == "listings":
+        update_listings(GitHub(), out, selected)
+    elif command == "fetch":
         fetch_source_run(out, selected)
     elif command == "verify":
-        checked_inputs(out, selected, bool(os.environ.get("SOURCE_RUN_ID")))
+        checked_inputs(out, selected, read_json(record) if record.is_file() else None)
     elif command == "publish":
-        publish(GitHub(), out, selected, bool(os.environ.get("SOURCE_RUN_ID")))
+        publish(GitHub(), out, selected, read_json(record) if record.is_file() else None)
     elif command == "plan":
         require(plugin != "all", "Building all plugins requires a signed source workflow run")
         plan = prepare(GitHub(), out, plugin)
@@ -520,7 +625,7 @@ def main():
             subprocess.run([sys.executable, SCRIPT, "build", "--lock", out / "lock.json", "--out", out,
                             "--version-code", str(plan["code"])], check=True)
     else:
-        raise SystemExit("usage: release.py plan|build|fetch|verify|publish")
+        raise SystemExit("usage: release.py select|listings|plan|build|fetch|verify|publish")
 
 
 if __name__ == "__main__":

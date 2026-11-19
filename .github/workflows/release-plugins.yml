@@ -1,26 +1,33 @@
 name: Release Pocket Studio plugins
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/**'
+      - 'scripts/release.py'
+      - 'scripts/test_release.py'
+      - '.github/workflows/release-plugins.yml'
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch:
     inputs:
       plugin:
-        description: Plugin to release
+        description: Plugins to synchronize
         type: choice
-        options: [codex, android, avf, proot, all]
-        default: codex
+        options: [all, codex, android, avf, proot]
+        default: all
       source_run_id:
-        description: Successful build-all run ID from the pinned PocketStudio commit
+        description: Source build run ID (defaults to the latest successful build)
         type: string
         required: false
       publish:
-        description: Publish verified artifacts to the plugin store
+        description: Publish the verified packages to the store
         type: boolean
-        default: false
+        default: true
       staging_tag:
-        description: Optional draft tag containing the signed plugin APKs and build metadata
+        description: Optional draft tag for an individual plugin
         type: string
         required: false
-  schedule:
-    - cron: '23 3 * * *'
 
 concurrency:
   group: plugin-store-release
@@ -28,81 +35,78 @@ concurrency:
 
 permissions: {}
 jobs:
-  release:
+  sync:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        plugin: ${{ fromJSON(github.event_name == 'schedule' && '["codex","android"]' || format('["{0}"]', inputs.plugin || 'codex')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
-      contents: write
       actions: read
+      contents: write
     env:
-      PLUGIN: ${{ matrix.plugin }}
+      PLUGIN: ${{ inputs.plugin || 'all' }}
       STAGING_TAG: ${{ inputs.staging_tag }}
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       CAN_SIGN: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - name: Check release behavior
         run: python3 -B scripts/test_release.py
-      - name: Select source and release mode
-        id: source
+      - name: Synchronize published listings and icons
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py listings
+      - name: Choose package source
+        id: mode
         run: |
-          set -eu
-          commit=$(cat SOURCE_COMMIT)
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          if [[ -n "$STAGING_TAG" && -n "$SOURCE_RUN_ID" ]]; then
-            echo "::error::Select either source_run_id or staging_tag."
-            exit 1
+          if [[ -n "$STAGING_TAG" ]]; then
+            [[ -z "$SOURCE_RUN_ID" && "$PLUGIN" != "all" ]]
+            echo "value=staging" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && -z "$SOURCE_RUN_ID" && "$CAN_SIGN" == true && ( "$PLUGIN" == codex || "$PLUGIN" == android ) ]]; then
+            echo "value=checkout" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=artifacts" >> "$GITHUB_OUTPUT"
           fi
-          if [[ "$PLUGIN" == all && -z "$SOURCE_RUN_ID" ]]; then
-            echo "::error::Select a successful source build-all run to verify all plugins."
-            exit 1
-          fi
-          if [[ -n "$SOURCE_RUN_ID" || -n "$STAGING_TAG" || "$CAN_SIGN" == true ]]; then
-            echo "active=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            echo "::error::Select a signed source run or a signed staging draft."
-            exit 1
-          fi
-      - name: Check out pinned build recipe
-        if: steps.source.outputs.active == 'true' && env.STAGING_TAG == '' && env.SOURCE_RUN_ID == ''
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Akaishi-Tech/PocketStudio
-          ref: ${{ steps.source.outputs.commit }}
-          path: source
-          persist-credentials: false
-      - name: Download signed artifacts from the pinned source run
-        if: env.SOURCE_RUN_ID != ''
+      - name: Discover successful source build
+        if: steps.mode.outputs.value == 'artifacts'
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_ACTIONS_READ_TOKEN || github.token }}
+        run: python3 scripts/release.py select
+      - name: Download updated plugin packages
+        id: packages
+        if: steps.source.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && !inputs.publish && steps.source.outputs.run_id != '')
         env:
           GH_TOKEN: ${{ secrets.SOURCE_ACTIONS_READ_TOKEN || github.token }}
         run: python3 scripts/release.py fetch
-      - name: Resolve release inputs
+      - name: Check out current source for a direct build
+        if: steps.mode.outputs.value == 'checkout'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Akaishi-Tech/PocketStudio
+          path: source
+          persist-credentials: false
+      - name: Resolve staging or direct-build inputs
+        if: steps.mode.outputs.value != 'artifacts'
         id: plan
-        if: steps.source.outputs.active == 'true' && env.SOURCE_RUN_ID == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release.py plan
       - name: Set up Java for manifest inspection
-        if: env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true'
+        if: steps.packages.outcome == 'success' || steps.plan.outputs.publish == 'true'
         run: |
           echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
           echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
-      - name: Set up plugin build
+      - name: Set up direct build
         if: steps.plan.outputs.build == 'true'
         working-directory: source
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0"
           git submodule update --init --depth=1 --filter=blob:none -- upstream/release/tools/base
-      - name: Build signed Android plugins
+      - name: Build signed Android plugin
         if: steps.plan.outputs.build == 'true'
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -117,10 +121,10 @@ jobs:
           unset ANDROID_KEYSTORE_BASE64
           python3 scripts/release.py build
       - name: Verify package metadata and contents
-        if: (env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true') && github.event_name == 'workflow_dispatch' && !inputs.publish
+        if: (steps.packages.outcome == 'success' || steps.plan.outputs.publish == 'true') && github.event_name == 'workflow_dispatch' && !inputs.publish
         run: python3 scripts/release.py verify
-      - name: Verify package metadata and contents and publish the store
-        if: (env.SOURCE_RUN_ID != '' || steps.plan.outputs.publish == 'true') && (github.event_name == 'schedule' || inputs.publish)
+      - name: Publish updated packages and catalog
+        if: (steps.packages.outcome == 'success' || steps.plan.outputs.publish == 'true') && (github.event_name != 'workflow_dispatch' || inputs.publish)
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release.py publish

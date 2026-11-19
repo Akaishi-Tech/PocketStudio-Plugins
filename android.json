@@ -1,0 +1,9 @@
+{
+  "package": "com.hcgstudio.pocketstudio.androidplugin",
+  "name": "Android",
+  "category": "development-environment",
+  "developer": "Akaishi Tech",
+  "description": "Create Android projects, manage SDKs, and build APKs on your device.",
+  "descriptions": {"zh": "在本机创建 Android 项目、管理 SDK 和构建 APK。"},
+  "icon": "Android.png"
+}

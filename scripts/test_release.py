@@ -117,6 +117,27 @@ class PluginReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Codex ABI"):
             r.codex_entry(self.info)
 
+    def test_android_publish_preserves_codex_and_skips_unchanged_build(self):
+        r.publish(self.gh, self.out)
+        plan = r.prepare(self.gh, self.out, "android")
+        self.assertTrue(plan["build"])
+        artifacts = []
+        for abi, name in r.ANDROID_FILES.items():
+            path = self.out / name
+            path.write_bytes(abi.encode())
+            artifacts.append(dict(abi=abi, file=name, size=path.stat().st_size, sha256=r.digest(path)))
+        info = dict(package=r.ANDROID_PACKAGE, version=plan["version"], versionCode=plan["code"],
+                    sourceCommit=plan["sourceCommit"], signerSha256=r.digest(r.PIN), artifacts=artifacts)
+        r.write_json(self.out / "android-build.json", info)
+        r.publish(self.gh, self.out, "android")
+        _, store, android = r.current(self.gh, self.out, r.ANDROID_PACKAGE)
+        self.assertEqual({entry["package"] for entry in store["plugins"]}, {r.PACKAGE, r.ANDROID_PACKAGE})
+        self.assertEqual(android["category"], "development-environment")
+        self.assertFalse(r.prepare(self.gh, self.out, "android")["publish"])
+        artifacts.pop()
+        with self.assertRaisesRegex(ValueError, "environment ABI"):
+            r.android_entry(info)
+
     def test_rejects_universal_plugin(self):
         plugin = r.codex_entry(self.info)
         artifact = dict(plugin["artifacts"][0], abi="universal")

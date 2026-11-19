@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from urllib.parse import urlencode
@@ -16,6 +17,9 @@ ABIS = ("arm64-v8a", "x86_64")
 PACKAGE = "com.hcgstudio.pocketstudio.codexplugin"
 PREFIX = "com.hcgstudio.pocketstudio."
 ABIFILES = {abi: f"PocketStudio-Codex-Plugin-{abi}.apk" for abi in ABIS}
+ANDROID_PACKAGE = "com.hcgstudio.pocketstudio.androidplugin"
+ANDROID_FLAVORS = {"arm64-v8a": "arm64V8a", "armeabi-v7a": "armeabiV7a", "x86_64": "x86_64", "x86": "x86"}
+ANDROID_FILES = {abi: f"PocketStudio-Android-Plugin-{abi}.apk" for abi in ANDROID_FLAVORS}
 PIN = Path("release_signer.der")
 ICON = Path("icons/Codex.png")
 SOURCE = Path("source")
@@ -124,7 +128,7 @@ def replace_asset(gh, rid, path, label):
 
 def version_components(value):
     match = re.fullmatch(VERSION, value)
-    require(match, "Invalid Codex version")
+    require(match, "Invalid plugin version")
     return tuple(int(part or 0) for part in match.groups())
 
 
@@ -171,11 +175,11 @@ def previous_store(gh, release, out):
     return validate_store(read_json(dest))
 
 
-def current(gh, out):
+def current(gh, out, package=PACKAGE):
     release = next((rel for rel in gh.releases() if rel["tag_name"] == TAG), {})
     store = previous_store(gh, release, out)
-    codex = next((entry for entry in store["plugins"] if entry["package"] == PACKAGE), None)
-    return release, store, codex
+    previous = next((entry for entry in store["plugins"] if entry["package"] == package), None)
+    return release, store, previous
 
 
 def codex_entry(info):
@@ -188,6 +192,33 @@ def codex_entry(info):
     require(re.fullmatch(HEX, entry["buildId"]), "Invalid Codex build ID")
     require({a["abi"]: a["file"] for a in entry["artifacts"]} == ABIFILES, "Missing or unexpected Codex ABI")
     return entry
+
+
+def android_entry(info):
+    descriptor = read_json(Path("android.json"))
+    require(info["package"] == descriptor["package"] == ANDROID_PACKAGE, "Incorrect Android environment package")
+    require(re.fullmatch(r"[0-9a-f]{40}", info["sourceCommit"]), "Invalid Android environment source revision")
+    entry = {key: info[key] for key in ("version", "versionCode", "sourceCommit", "signerSha256", "artifacts")}
+    entry.update(descriptor)
+    validate_store({"schemaVersion": 2, "plugins": [entry]})
+    require({a["abi"]: a["file"] for a in entry["artifacts"]} == ANDROID_FILES, "Missing or unexpected Android environment ABI")
+    version_components(entry["version"])
+    return entry
+
+
+def build_android(out, plan):
+    env = {**os.environ, "POCKETSTUDIO_VERSION_NAME": plan["version"], "POCKETSTUDIO_VERSION_CODE": str(plan["code"])}
+    subprocess.run(["./gradlew", "--no-daemon", ":android-plugin:assembleRelease"], cwd=SOURCE, env=env, check=True)
+    artifacts = []
+    for abi, flavor in ANDROID_FLAVORS.items():
+        variant = SOURCE / "build-support/android-plugin/build/outputs/apk" / flavor / "release"
+        apk, = read_json(variant / "output-metadata.json")["elements"]
+        path = out / ANDROID_FILES[abi]
+        shutil.copyfile(variant / apk["outputFile"], path)
+        artifacts.append({"abi": abi, "file": path.name, "size": path.stat().st_size, "sha256": digest(path)})
+    write_json(out / "android-build.json", {"package": ANDROID_PACKAGE, "version": plan["version"],
+               "versionCode": plan["code"], "sourceCommit": plan["sourceCommit"],
+               "signerSha256": digest(PIN), "artifacts": artifacts})
 
 
 def next_code(version, previous):
@@ -212,34 +243,52 @@ def verify(entry, out):
                 f"APK signer or v2 signature mismatch: {apk.name}")
         pkg = subprocess.check_output([tools / "aapt", "dump", "badging", apk], text=True)
         fields = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']*)'", pkg, re.M)
-        require(fields and fields.groups() == (PACKAGE, str(entry["versionCode"]), entry["version"]),
+        require(fields and fields.groups() == (entry["package"], str(entry["versionCode"]), entry["version"]),
                 f"Package or version mismatch: {apk.name}")
         with zipfile.ZipFile(apk) as data:
             native = {name.split("/")[1] for name in data.namelist() if name.startswith("lib/")}
-            require(native == {abi} and f"lib/{abi}/libcodex_app_server.so" in data.namelist(),
-                    f"Incorrect native libraries in {apk.name}")
+            require(native == {abi}, f"Incorrect native ABI in {apk.name}")
+            if entry["package"] == ANDROID_PACKAGE:
+                required = {f"lib/{abi}/libaapt2.so", f"lib/{abi}/libstudio_jdk_bin_java.so",
+                            f"assets/local-jdk/{abi}.zip", "assets/template/gradlew"}
+                require(required.issubset(data.namelist()), f"Android toolchain missing from {apk.name}")
+                continue
+            require(f"lib/{abi}/libcodex_app_server.so" in data.namelist(), f"Codex payload missing from {apk.name}")
             require(data.read("assets/codex-build").decode() == entry["buildId"] and
                     data.read("assets/codex-version").decode() == entry["version"], "Codex payload identity mismatch")
 
 
-def prepare(gh, out):
-    release, _, previous = current(gh, out)
+def prepare(gh, out, plugin="codex"):
+    android = plugin == "android"
+    release, _, previous = current(gh, out, ANDROID_PACKAGE if android else PACKAGE)
+    build_file = plugin + "-build.json"
     staging = os.environ.get("STAGING_TAG", "")
     if staging:
-        match = re.fullmatch(r"incoming-codex-([1-9][0-9]{0,9})", staging)
+        match = re.fullmatch(r"incoming-" + plugin + r"-([1-9][0-9]{0,9})", staging)
         require(match, "Invalid staging tag")
         draft = next((r for r in gh.releases() if r["tag_name"] == staging and r["draft"]), None)
         require(draft, "Staging draft missing")
-        metadata = asset(draft, BUILD)
+        metadata = asset(draft, build_file)
         require(metadata and 0 < metadata["size"] <= 262144, "Missing staged metadata")
-        gh.download(metadata, out / BUILD)
-        entry = codex_entry(read_json(out / BUILD))
+        gh.download(metadata, out / build_file)
+        info = read_json(out / build_file)
+        entry = android_entry(info) if android else codex_entry(info)
         require(str(entry["versionCode"]) == match[1], "Staging tag/versionCode mismatch")
         for artifact in entry["artifacts"]:
             item = asset(draft, artifact["file"])
             require(matches(item, artifact["sha256"], artifact["size"]), "Missing or invalid staged APK")
             gh.download(item, out / artifact["file"])
         return {"publish": True, "build": False}
+
+    if android:
+        source_commit = Path("SOURCE_COMMIT").read_text().strip()
+        icon = Path("icons/Android.png")
+        if (previous and not release["draft"] and previous["sourceCommit"] == source_commit and
+                previous == android_entry(previous) and matches(asset(release, icon.name), digest(icon), icon.stat().st_size)
+                and all(matches(asset(release, a["file"]), a["sha256"], a["size"]) for a in previous["artifacts"])):
+            return {"publish": False, "build": False}
+        code = previous["versionCode"] + 1 if previous else 1
+        return {"publish": True, "build": True, "code": code, "version": f"1.0.{code - 1}", "sourceCommit": source_commit}
 
     subprocess.run([sys.executable, SCRIPT, "resolve", "--output", out / "lock.json"], check=True)
     lock = read_json(out / "lock.json")
@@ -252,27 +301,28 @@ def prepare(gh, out):
     return {"publish": True, "build": True, "code": next_code(lock["version"], previous)}
 
 
-def publish(gh, out):
-    entry = codex_entry(read_json(out / BUILD))
+def publish(gh, out, plugin="codex"):
+    info = read_json(out / (plugin + "-build.json"))
+    entry = android_entry(info) if plugin == "android" else codex_entry(info)
+    icon = Path("icons") / entry["icon"]
     verify(entry, out)
-    release, store, previous = current(gh, out)
+    release, store, previous = current(gh, out, entry["package"])
     if previous:
         require(version_components(entry["version"]) >= version_components(previous["version"]), "Version downgrade")
         require(entry["versionCode"] > previous["versionCode"] or
                 (entry["versionCode"] == previous["versionCode"] and entry["artifacts"] == previous["artifacts"]),
                 "A changed APK requires a newer versionCode")
-    store["plugins"] = [other for other in store["plugins"] if other["package"] != PACKAGE] + [entry]
-    require(ICON.name == entry["icon"], "Catalog icon missing")
+    store["plugins"] = [other for other in store["plugins"] if other["package"] != entry["package"]] + [entry]
     write_json(out / MANIFEST, validate_store(store))
     if not release:
-        release = gh.create(TAG, "Pocket Studio Plugin Store", "Install plugins from **Settings → Plugin store** in Pocket Studio.")
+        release = gh.create(TAG, "Pocket Studio Plugin Store", "Open **Plugin store** in Pocket Studio to install plugins.")
     rid = release["id"]
     for a in entry["artifacts"]:
-        replace_asset(gh, rid, out / a["file"], f"Codex {entry['version']} ({entry['versionCode']}) · {a['abi']}")
-    replace_asset(gh, rid, ICON, "Codex")
+        replace_asset(gh, rid, out / a["file"], f"{entry['name']} {entry['version']} ({entry['versionCode']}) · {a['abi']}")
+    replace_asset(gh, rid, icon, entry["name"])
     replace_asset(gh, rid, out / MANIFEST, "Pocket Studio plugin catalog")
     gh.api(f"releases/{rid}", method="PATCH", body={"draft": False, "make_latest": "true"})
-    names = (MANIFEST, ICON.name, *ABIFILES.values())
+    names = (MANIFEST, icon.name, *(a["file"] for a in entry["artifacts"]))
     for item in gh.api(f"releases/{rid}")["assets"]:
         if item["name"].startswith(("previous-", "stage-")) and item["name"].endswith(names):
             gh.remove(item)
@@ -280,20 +330,25 @@ def publish(gh, out):
 
 def main():
     command, = sys.argv[1:]
+    plugin = os.environ.get("PLUGIN", "codex")
+    require(plugin in ("android", "codex"), "Unknown plugin")
     out = Path(os.environ["RUNNER_TEMP"]) / "plugin-release"
     out.mkdir(exist_ok=True)
     if command == "plan":
-        plan = prepare(GitHub(), out)
+        plan = prepare(GitHub(), out, plugin)
         write_json(out / "plan.json", plan)
         with open(os.environ["GITHUB_OUTPUT"], "a") as outputs:
             for key in ("build", "publish"):
                 print(f"{key}={str(plan[key]).lower()}", file=outputs)
     elif command == "build":
         plan = read_json(out / "plan.json")
+        if plugin == "android":
+            build_android(out, plan)
+            return
         subprocess.run([sys.executable, SCRIPT, "build", "--lock", out / "lock.json", "--out", out,
                         "--version-code", str(plan["code"])], check=True)
     elif command == "publish":
-        publish(GitHub(), out)
+        publish(GitHub(), out, plugin)
     else:
         raise SystemExit("usage: release.py plan|build|publish")
 

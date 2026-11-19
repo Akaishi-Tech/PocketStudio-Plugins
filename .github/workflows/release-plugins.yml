@@ -2,8 +2,13 @@ name: Release Pocket Studio plugins
 on:
   workflow_dispatch:
     inputs:
+      plugin:
+        description: Plugin to release
+        type: choice
+        options: [codex, android]
+        default: codex
       staging_tag:
-        description: Optional draft tag with the signed per-ABI Codex APKs and codex-build.json
+        description: Optional draft tag containing the signed plugin APKs and build metadata
         type: string
         required: false
   schedule:
@@ -17,11 +22,17 @@ permissions: {}
 jobs:
   release:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(github.event_name == 'schedule' && '["codex","android"]' || format('["{0}"]', inputs.plugin || 'codex')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
       contents: write
     env:
+      PLUGIN: ${{ matrix.plugin }}
       STAGING_TAG: ${{ inputs.staging_tag }}
       CAN_SIGN: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
     steps:

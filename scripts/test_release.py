@@ -1,13 +1,40 @@
 """Check publication and recovery of the store catalog using an in-memory release."""
 import copy
+import gzip
 import hashlib
+import io
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import release as r
+
+
+class LinuxImageTests(unittest.TestCase):
+    def test_gzip_bytes_survive_apk_packaging(self):
+        compressed = gzip.compress(b"Debian filesystem")
+        for payload, checksum in (("debian-image.bin", "debian.img.sha256"),
+                                  ("debian-rootfs.bin", "debian-rootfs.sha256")):
+            for content, method, error in [
+                (compressed, zipfile.ZIP_STORED, None),
+                (b"expanded by aapt", zipfile.ZIP_STORED, "gzip stream"),
+                (compressed, zipfile.ZIP_DEFLATED, "stored verbatim"),
+                (compressed + b"changed", zipfile.ZIP_STORED, "checksum mismatch"),
+            ]:
+                with self.subTest(payload=payload, error=error):
+                    buffer = io.BytesIO()
+                    with zipfile.ZipFile(buffer, "w") as apk:
+                        apk.writestr("assets/" + checksum, hashlib.sha256(compressed).hexdigest() + "\n")
+                        apk.writestr("assets/" + payload, content, compress_type=method)
+                    with zipfile.ZipFile(buffer) as apk:
+                        if error is None:
+                            r.verify_gzip_asset(apk, payload, checksum)
+                        else:
+                            with self.assertRaisesRegex(ValueError, error):
+                                r.verify_gzip_asset(apk, payload, checksum)
 
 
 class FakeGitHub:

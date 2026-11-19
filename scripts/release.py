@@ -250,6 +250,16 @@ def next_code(version, previous):
     return max(1700003, floor, previous["versionCode"] + 1 if previous else 0)
 
 
+def verify_gzip_asset(apk, payload_name, checksum_name):
+    member = apk.getinfo("assets/" + payload_name)
+    require(member.compress_type == zipfile.ZIP_STORED, f"{payload_name} must be stored verbatim in the APK")
+    manifest = apk.read("assets/" + checksum_name).decode("ascii").strip()
+    require(re.fullmatch(HEX, manifest), f"Invalid image checksum: {checksum_name}")
+    with apk.open(member) as image:
+        require(image.peek(2)[:2] == b"\x1f\x8b", f"{payload_name} does not contain a gzip stream")
+        require(digest_stream(image) == manifest, f"Image checksum mismatch: {payload_name}")
+
+
 def verify(entry, out):
     tools = Path(os.environ["ANDROID_HOME"]) / "build-tools/37.0.0"
     for artifact in entry["artifacts"]:
@@ -272,22 +282,18 @@ def verify(entry, out):
             native = {name.split("/")[1] for name in data.namelist() if name.startswith("lib/")}
             if entry["package"] == PREFIX + "avfplugin":
                 require(not native, f"AVF plugin unexpectedly includes Android native libraries: {apk.name}")
-                bundle = {"assets/debian.img.gz", "assets/debian.img.sha256", "assets/replace.sh",
+                bundle = {"assets/debian-image.bin", "assets/debian.img.sha256", "assets/replace.sh",
                           "assets/linux-languages.json", "assets/linux-image-abi"}
                 require(bundle.issubset(data.namelist()) and data.read("assets/linux-image-abi").decode().strip() == abi,
                         f"Missing or wrong AVF disk payload for {abi}")
-                sha = data.read("assets/debian.img.sha256").decode().split()[0]
-                with data.open("assets/debian.img.gz") as image:
-                    require(digest_stream(image) == sha, "AVF disk checksum mismatch")
+                verify_gzip_asset(data, "debian-image.bin", "debian.img.sha256")
                 continue
             require(native == {abi}, f"Incorrect native ABI in {apk.name}")
             if entry["package"] == PREFIX + "prootplugin":
-                required = {"assets/linux-languages.json", "assets/debian-rootfs.tar.gz", "assets/debian-rootfs.sha256",
+                required = {"assets/linux-languages.json", "assets/debian-rootfs.bin", "assets/debian-rootfs.sha256",
                             f"lib/{abi}/libproot_runtime.so", f"lib/{abi}/libproot_loader.so"}
                 require(required.issubset(data.namelist()), f"PRoot environment missing from {apk.name}")
-                sha = data.read("assets/debian-rootfs.sha256").decode().split()[0]
-                with data.open("assets/debian-rootfs.tar.gz") as image:
-                    require(digest_stream(image) == sha, "PRoot image checksum mismatch")
+                verify_gzip_asset(data, "debian-rootfs.bin", "debian-rootfs.sha256")
                 continue
             if entry["package"] == ANDROID_PACKAGE:
                 required = {f"lib/{abi}/libaapt2.so", f"lib/{abi}/libstudio_jdk_bin_java.so",

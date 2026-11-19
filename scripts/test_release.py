@@ -13,6 +13,20 @@ from unittest.mock import patch
 import release as r
 
 
+class ManifestTests(unittest.TestCase):
+    def test_verifies_package_and_both_versions(self):
+        sdk, apk = Path("/sdk"), Path("signed.apk")
+        entry = dict(package="com.hcgstudio.pocketstudio.avfplugin", versionCode=3, version="1.0.2")
+        with patch.object(r.subprocess, "check_output", return_value="com.hcgstudio.pocketstudio.avfplugin 3 1.0.2\n") as run:
+            r.verify_apk_manifest(sdk, apk, entry)
+            run.assert_called_once_with([sdk / "cmdline-tools/latest/bin/apkanalyzer", "apk", "summary", apk], text=True)
+        for mismatch in ("other.app 3 1.0.2", "com.hcgstudio.pocketstudio.avfplugin 4 1.0.2",
+                         "com.hcgstudio.pocketstudio.avfplugin 3 1.0.1"):
+            with self.subTest(summary=mismatch), patch.object(r.subprocess, "check_output", return_value=mismatch):
+                with self.assertRaisesRegex(ValueError, "Package or version"):
+                    r.verify_apk_manifest(sdk, apk, entry)
+
+
 class LinuxImageTests(unittest.TestCase):
     def test_gzip_bytes_survive_apk_packaging(self):
         compressed = gzip.compress(b"Debian filesystem")
@@ -67,11 +81,11 @@ class FakeGitHub:
         self.rows.append(row)
         return copy.deepcopy(row)
 
-    def upload(self, rid, path, name, label):
+    def upload(self, rid, path, name):
         row = next(v for v in self.rows if v["id"] == rid)
         assert not r.asset(row, name)
         data = path.read_bytes()
-        item = dict(id=len(self.files) + 1, name=name, label=label, size=len(data), state="uploaded",
+        item = dict(id=len(self.files) + 1, name=name, label=None, size=len(data), state="uploaded",
                     digest="sha256:" + hashlib.sha256(data).hexdigest())
         self.files[item["id"]] = data
         row["assets"].append(item)
@@ -84,8 +98,9 @@ class FakeGitHub:
                     if self.fail_promotion and name == r.MANIFEST and row["name"] == r.STAGED_CATALOG:
                         self.fail_promotion = False
                         raise OSError("Interrupted catalog promotion")
-                    assert not r.asset(release, name)
-                    row["name"] = name
+                    collision = r.asset(release, name)
+                    assert collision is None or collision["id"] == item["id"]
+                    row.update(name=name, label="")
                     return copy.deepcopy(row)
         raise AssertionError("Unknown asset ID")
 
@@ -126,6 +141,7 @@ class PluginReleaseTests(unittest.TestCase):
         self.assertEqual({p["package"] for p in store["plugins"]}, {r.listing(k)["package"] for k in r.PLUGINS})
         self.assertIsNotNone(r.asset(release, r.MANIFEST))
         for row in release["assets"]:
+            self.assertFalse(row.get("label"))
             self.assertRegex(row["name"], r"1\.0\.0-2|^plugin-store\.json$")
         r.publish(self.gh, self.out, r.PLUGINS)
         self.assertEqual(release, self.gh.releases()[0])
@@ -140,7 +156,9 @@ class PluginReleaseTests(unittest.TestCase):
         self.gh.fail_promotion = True
         with self.assertRaisesRegex(OSError, "Interrupted"):
             r.publish(self.gh, self.out)
-        self.assertEqual(r.current(self.gh, self.out)[2]["versionCode"], 2)
+        restored = r.current(self.gh, self.out)
+        self.assertEqual(restored[2]["versionCode"], 2)
+        self.assertFalse(r.asset(restored[0], r.MANIFEST).get("label"))
         r.publish(self.gh, self.out)
         self.assertEqual(r.current(self.gh, self.out)[2]["versionCode"], 3)
 
@@ -179,7 +197,7 @@ class PluginReleaseTests(unittest.TestCase):
         tag = "incoming-avf-2"
         draft = self.gh.create(tag, "")
         for name in ("avf-build.json", *r.abi_files("avf").values()):
-            self.gh.upload(draft["id"], self.out/name, name, "")
+            self.gh.upload(draft["id"], self.out/name, name)
         os.environ["STAGING_TAG"] = tag
         self.assertEqual(r.prepare(self.gh, self.out, "avf"), {"publish": True, "build": False})
         info["artifacts"].pop()

@@ -98,29 +98,31 @@ class GitHub:
         return self.api("releases", method="POST", body={"tag_name": tag, "body": body,
                         "draft": True, "target_commitish": os.environ["GITHUB_SHA"], "make_latest": "false"})
 
-    def upload(self, rid, path, name, label):
-        query = urlencode({"name": name, "label": label})
+    def upload(self, rid, path, name):
+        query = urlencode({"name": name})
         url = f"https://uploads.github.com/repos/{self.repo}/releases/{rid}/assets?{query}"
         mime = {".apk": "application/vnd.android.package-archive", ".json": "application/json", ".png": "image/png"}[path.suffix]
         return json.loads(subprocess.check_output(["gh", "api", url, "--method", "POST",
                           "--header", "Content-Type: " + mime, "--input", str(path)]))
 
     def rename(self, item, name):
-        return self.api(f"releases/assets/{item['id']}", method="PATCH", body={"name": name})
+        return self.api(f"releases/assets/{item['id']}", method="PATCH", body={"name": name, "label": ""})
 
     def remove(self, item):
         self.api(f"releases/assets/{item['id']}", method="DELETE")
 
 
-def immutable_asset(gh, release, path, label):
+def immutable_asset(gh, release, path):
     previous = asset(release, path.name)
     sha, size = digest(path), path.stat().st_size
     if previous and previous["state"] == "uploaded":
         require(matches(previous, sha, size), f"Immutable release filename already exists: {path.name}")
+        if previous.get("label"):
+            gh.rename(previous, path.name)
         return
     if previous:
         gh.remove(previous)  # A failed GitHub upload can leave an empty starter asset.
-    item = gh.upload(release["id"], path, path.name, label)
+    item = gh.upload(release["id"], path, path.name)
     require(matches(item, sha, size), f"GitHub did not confirm the upload of {path.name}")
     release["assets"].append(item)
 
@@ -260,8 +262,17 @@ def verify_gzip_asset(apk, payload_name, checksum_name):
         require(digest_stream(image) == manifest, f"Image checksum mismatch: {payload_name}")
 
 
+def verify_apk_manifest(sdk, apk, entry):
+    # apkanalyzer's apk summary reads manifest identity without resolving UI resources.
+    analyzer = sdk / "cmdline-tools/latest/bin/apkanalyzer"
+    summary = subprocess.check_output([analyzer, "apk", "summary", apk], text=True)
+    require(summary.split() == [entry["package"], str(entry["versionCode"]), entry["version"]],
+            f"Package or version mismatch: {apk.name}")
+
+
 def verify(entry, out):
-    tools = Path(os.environ["ANDROID_HOME"]) / "build-tools/37.0.0"
+    sdk = Path(os.environ["ANDROID_HOME"])
+    tools = sdk / "build-tools/37.0.0"
     for artifact in entry["artifacts"]:
         abi = artifact["abi"]
         apk = out / artifact["file"]
@@ -274,10 +285,7 @@ def verify(entry, out):
         modern_scheme = re.search(r"^Verified using v(?:2|3(?:\.1)?) scheme [^\n]+: true$", signing, re.M)
         require("Number of signers: 1" in signing.splitlines() and set(signers) == {digest(PIN)} and modern_scheme,
                 f"APK signer or modern signature mismatch: {apk.name}")
-        pkg = subprocess.check_output([tools / "aapt", "dump", "badging", apk], text=True)
-        fields = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']*)'", pkg, re.M)
-        require(fields and fields.groups() == (entry["package"], str(entry["versionCode"]), entry["version"]),
-                f"Package or version mismatch: {apk.name}")
+        verify_apk_manifest(sdk, apk, entry)
         with zipfile.ZipFile(apk) as data:
             native = {name.split("/")[1] for name in data.namelist() if name.startswith("lib/")}
             if entry["package"] == PREFIX + "avfplugin":
@@ -385,13 +393,15 @@ def replace_catalog(gh, release, catalog):
             current = gh.rename(backup, MANIFEST)
     sha, size = digest(catalog), catalog.stat().st_size
     if matches(current, sha, size):
+        if current.get("label"):
+            gh.rename(current, MANIFEST)
         if staged:
             gh.remove(staged)
         return
     if not matches(staged, sha, size):
         if staged:
             gh.remove(staged)
-        staged = gh.upload(release["id"], catalog, STAGED_CATALOG, "Pocket Studio plugin catalog")
+        staged = gh.upload(release["id"], catalog, STAGED_CATALOG)
         require(matches(staged, sha, size), "GitHub did not verify the staged catalog")
     try:
         if current:
@@ -438,7 +448,7 @@ def publish(gh, out, plugins=("codex",), require_pin=False):
         if not release:
             release = gh.create(TAG, "Open the plugin store in Pocket Studio to install these packages.")
         for path in sorted(work.iterdir()):
-            immutable_asset(gh, release, path, path.name)
+            immutable_asset(gh, release, path)
         gh.assets(release)
         for entry in updated["plugins"]:
             icon = asset(release, entry["icon"])
